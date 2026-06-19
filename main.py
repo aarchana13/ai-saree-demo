@@ -35,6 +35,9 @@ RUNWARE_URL = "https://api.runware.ai/v1"
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+# Reusable HTTP client for faster network performance (avoids repeated SSL handshakes)
+http_client = httpx.AsyncClient(timeout=120)
+
 ANALYSIS_MODEL = "gemini-3.1-flash-lite"
 DisplayType = Literal["model", "mannequin", "flat", "hanging"]
 
@@ -43,18 +46,15 @@ DisplayType = Literal["model", "mannequin", "flat", "hanging"]
 # --------------------------------------------------------------------------
 
 class GenerateRequest(BaseModel):
-    reference_image: str  # base64 or data URI of the ORIGINAL saree photo
-    display_types: List[str] = ["model"]  # Supports multiple choices concurrently
-    catalog: Optional[Dict[str, Any]] = None  # output of /api/analyze
-    prompt_override: Optional[str] = None  # base fallback prompt override
-
+    reference_image: str  
+    display_types: List[str] = ["model"]  
+    catalog: Optional[Dict[str, Any]] = None  
+    prompt_override: Optional[str] = None  
 
 class RunwareError(RuntimeError):
     pass
 
-
 class CostTracker:
-    """In-memory cost tracker for this server process."""
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self.total_cost = 0.0
@@ -63,15 +63,12 @@ class CostTracker:
     async def record(self, cost: Optional[float]) -> None:
         if cost is None:
             return
-
         async with self._lock:
             self.generation_count += 1
             self.total_cost += cost
             logger.info(
                 "[COST] generation #%d: $%.4f this call | $%.4f total this session",
-                self.generation_count,
-                cost,
-                self.total_cost,
+                self.generation_count, cost, self.total_cost,
             )
 
     def summary(self) -> Dict[str, Any]:
@@ -112,7 +109,6 @@ DISPLAY_DIRECTIVES: Dict[str, str] = {
 
 def build_display_prompt(catalog: Dict[str, Any], display_type: str) -> str:
     directive = DISPLAY_DIRECTIVES.get(display_type, DISPLAY_DIRECTIVES["model"])
-
     fidelity_clause = (
         "This must be the EXACT SAME saree shown in the attached reference "
         f"image: same {catalog.get('primary_color', 'base')} base color, same "
@@ -122,64 +118,67 @@ def build_display_prompt(catalog: Dict[str, Any], display_type: str) -> str:
         "texture and sheen. Do not invent a new pattern, do not change any "
         "color, do not redesign the border or pallu."
     )
-
-    style_notes = catalog.get(
-        "style_notes", "soft natural studio lighting, plain neutral backdrop"
-    )
-
+    style_notes = catalog.get("style_notes", "soft natural studio lighting, plain neutral backdrop")
     return f"{fidelity_clause} {directive} {style_notes}."
-
 
 def _strip_data_uri(value: str) -> str:
     return value.split(",", 1)[1] if "," in value else value
-
 
 def _as_data_uri(b64: str, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{b64}"
 
 # --------------------------------------------------------------------------
-# Runware client / Generation Core (Smart Routing)
+# Runware client / Generation Core (Batch Routing)
 # --------------------------------------------------------------------------
 
-async def generate_image(prompt: str, reference_b64: str, display_type: str) -> Dict[str, Any]:
-    """Builds and sends the task to Runware, routing to the best model for the job."""
+async def generate_images_batch(requests_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sends multiple generation tasks in a SINGLE API call for maximum speed."""
     if not RUNWARE_API_KEY:
         raise RunwareError("Runware API key missing.")
 
-    if display_type == "model":
-        target_model = "google:4@3"  # Nano Banana 2
-        extra_params = {"resolution": "1K"}
-        negative_prompt = None
-    else:
-        target_model = "bfl:3@1"  # FLUX.1 Kontext Pro
-        extra_params = {
-            "width": 832, 
-            "height": 1248,
-            "providerSettings": {"bfl": {"promptUpsampling": False}}
+    tasks = []
+    task_map = {} 
+
+    for req in requests_data:
+        display_type = req["display_type"]
+        prompt = req["prompt"]
+        reference_b64 = req["reference_b64"]
+
+        if display_type == "model":
+            target_model = "google:4@3" 
+            extra_params = {"resolution": "1K"}
+        else:
+            target_model = "bfl:3@1" 
+            extra_params = {
+                "width": 832, 
+                "height": 1248,
+                "providerSettings": {"bfl": {"promptUpsampling": False}}
+            }
+
+        task_uuid = str(uuid.uuid4())
+        task = {
+            "taskType": "imageInference",
+            "taskUUID": task_uuid,
+            "model": target_model, 
+            "positivePrompt": prompt,
+            "outputType": "URL",
+            "includeCost": True,
+            "inputs": {"referenceImages": [_as_data_uri(reference_b64)]}
         }
-        negative_prompt = None  # FLUX doesn't use standard negative prompts
+        task.update(extra_params)
+        
+        tasks.append(task)
+        task_map[task_uuid] = {
+            "display_type": display_type,
+            "prompt_used": prompt,
+            "backend_used": target_model
+        }
 
-    task: Dict[str, Any] = {
-        "taskType": "imageInference",
-        "taskUUID": str(uuid.uuid4()),
-        "model": target_model, 
-        "positivePrompt": prompt,
-        "outputType": "URL",
-        "includeCost": True,
-        "inputs": {"referenceImages": [_as_data_uri(reference_b64)]}
-    }
-    
-    task.update(extra_params)
-    if negative_prompt:
-        task["negativePrompt"] = negative_prompt
-
-    body = [{"taskType": "authentication", "apiKey": RUNWARE_API_KEY}, task]
+    # Pack all tasks into one payload
+    body = [{"taskType": "authentication", "apiKey": RUNWARE_API_KEY}] + tasks
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                RUNWARE_URL, json=body, headers={"Content-Type": "application/json"}
-            )
+        resp = await http_client.post(RUNWARE_URL, json=body, headers={"Content-Type": "application/json"})
     except httpx.HTTPError as exc:
         raise RunwareError(f"Could not reach Runware: {exc}") from exc
 
@@ -191,13 +190,24 @@ async def generate_image(prompt: str, reference_b64: str, display_type: str) -> 
     if resp.status_code >= 400 or payload.get("errors"):
         raise RunwareError(f"Runware error: {payload.get('errors', payload)}")
 
+    results = []
+    # Map the returning images back to their specific style using the UUID
     for item in payload.get("data", []):
-        if "imageURL" in item or "imageUUID" in item:
-            item["backend_used"] = target_model 
-            item["negative_prompt_used"] = negative_prompt
-            return item
+        task_uuid = item.get("taskUUID")
+        if task_uuid in task_map and ("imageURL" in item or "imageUUID" in item):
+            meta = task_map[task_uuid]
+            results.append({
+                "image_url": item.get("imageURL"),
+                "backend": meta["backend_used"],
+                "display_type": meta["display_type"],
+                "prompt_used": meta["prompt_used"],
+                "cost": item.get("cost")
+            })
 
-    raise RunwareError("Runware returned no image data.")
+    if not results:
+        raise RunwareError("Runware returned no image data.")
+        
+    return results
 
 # --------------------------------------------------------------------------
 # Routes
@@ -210,7 +220,6 @@ async def serve_dashboard(request: Request):
 @app.get("/api/cost-summary")
 async def get_cost_summary():
     return JSONResponse(content=cost_tracker.summary())
-
 
 @app.post("/api/analyze")
 async def analyze_saree_inventory(file: UploadFile = File(...), style: str = Form(...)):
@@ -250,53 +259,41 @@ async def analyze_saree_inventory(file: UploadFile = File(...), style: str = For
 
     except json.JSONDecodeError as error:
         logger.warning("Gemini returned non-JSON output: %s", error)
-        return JSONResponse(
-            status_code=502,
-            content={"error": f"Gemini returned output that wasn't valid JSON: {error}"},
-        )
+        return JSONResponse(status_code=502, content={"error": f"Gemini returned output that wasn't valid JSON: {error}"})
     except Exception as error:
         logger.exception("analyze_saree_inventory failed")
         return JSONResponse(status_code=500, content={"error": str(error)})
 
-
 @app.post("/api/generate")
 async def generate_model_images(req: GenerateRequest):
     clean_b64 = _strip_data_uri(req.reference_image)
-    
-    tasks = []
     styles_to_process = req.display_types if req.display_types else ["model"]
     
-    # Map and prepare prompts for requested types
+    batch_requests = []
+    
     for display_type in styles_to_process:
-        # CRITICAL MULTI-SELECT FIX:
-        # If they select multiple styles, we MUST ignore the UI text box because 
-        # a single text box cannot hold the instructions for a model AND a flat lay.
-        # We force the backend to build a unique prompt for each requested style.
         if len(styles_to_process) == 1 and display_type == "model" and req.prompt_override:
             prompt = req.prompt_override
         else:
             prompt = build_display_prompt(req.catalog or {}, display_type)
             
-        tasks.append((display_type, prompt))
+        batch_requests.append({
+            "display_type": display_type,
+            "prompt": prompt,
+            "reference_b64": clean_b64
+        })
         
-    # Execution wrapper mapping single responses
-    async def run_single(d_type, pr):
-        res = await generate_image(prompt=pr, reference_b64=clean_b64, display_type=d_type)
-        await cost_tracker.record(res.get("cost"))
-        return {
-            "image_url": res.get("imageURL"),
-            "backend": res.get("backend_used", "unknown"),
-            "display_type": d_type,
-            "prompt_used": pr,
-            "cost": res.get("cost"),
-        }
-
     try:
-        # Fire all requests at the exact same time asynchronously
-        generated_results = await asyncio.gather(*(run_single(dt, p) for dt, p in tasks))
+        # Trigger the optimized batch generation
+        generated_results = await generate_images_batch(batch_requests)
+        
+        # Log costs synchronously after successful return
+        for res in generated_results:
+            await cost_tracker.record(res.get("cost"))
+            
         return JSONResponse(content={"results": generated_results})
     except RunwareError as error:
         return JSONResponse(status_code=502, content={"error": str(error)})
     except Exception as error:
-        logger.exception("Concurrent generation pipeline failed")
+        logger.exception("Batch generation pipeline failed")
         return JSONResponse(status_code=500, content={"error": str(error)})
